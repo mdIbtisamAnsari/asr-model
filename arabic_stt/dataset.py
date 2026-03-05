@@ -446,6 +446,254 @@ def create_dataloaders(
     return train_loader, val_loader
 
 
+class QuranDataset(Dataset):
+    """
+    Dataset loader for Quran recitation datasets from HuggingFace.
+    
+    Supported datasets:
+    - "arbml/quran_speech" (Quran Speech Dataset)
+    - "tarteel-ai/everyayah" (EveryAyah dataset)
+    - Custom Quran datasets
+    
+    Usage:
+        dataset = QuranDataset(dataset_name="arbml/quran_speech", split="train")
+    """
+    
+    def __init__(
+        self,
+        dataset_name: str = "arbml/quran_speech",
+        split: str = 'train',
+        audio_column: str = 'audio',
+        text_column: str = 'text',
+        audio_processor: Optional[AudioProcessor] = None,
+        text_processor: Optional[TextProcessor] = None,
+        max_audio_len: int = 3000,
+        max_text_len: int = 500,
+        subset: Optional[str] = None
+    ):
+        """
+        Args:
+            dataset_name: HuggingFace dataset name (e.g., "arbml/quran_speech")
+            split: Dataset split ('train', 'test', 'validation')
+            audio_column: Column name containing audio data
+            text_column: Column name containing Arabic text/ayah
+            audio_processor: Optional AudioProcessor instance
+            text_processor: Optional TextProcessor instance
+            max_audio_len: Maximum audio length in frames
+            max_text_len: Maximum text length in characters
+            subset: Dataset subset/config name (if applicable)
+        """
+        try:
+            from datasets import load_dataset
+        except ImportError:
+            raise ImportError("Please install 'datasets' library: pip install datasets")
+        
+        self.audio_processor = audio_processor or AudioProcessor()
+        self.text_processor = text_processor or TextProcessor()
+        self.max_audio_len = max_audio_len
+        self.max_text_len = max_text_len
+        self.audio_column = audio_column
+        self.text_column = text_column
+        
+        # Load dataset from HuggingFace
+        print(f"Loading {dataset_name} ({split}) dataset...")
+        
+        try:
+            if subset:
+                self.dataset = load_dataset(
+                    dataset_name,
+                    subset,
+                    split=split,
+                    trust_remote_code=True
+                )
+            else:
+                self.dataset = load_dataset(
+                    dataset_name,
+                    split=split,
+                    trust_remote_code=True
+                )
+        except Exception as e:
+            print(f"Error loading dataset: {e}")
+            print("\nTrying alternative column detection...")
+            self.dataset = load_dataset(dataset_name, split=split, trust_remote_code=True)
+        
+        # Auto-detect columns if needed
+        columns = self.dataset.column_names
+        print(f"Dataset columns: {columns}")
+        
+        # Try to find audio column
+        if self.audio_column not in columns:
+            audio_candidates = ['audio', 'path', 'audio_path', 'file', 'wav', 'recording']
+            for candidate in audio_candidates:
+                if candidate in columns:
+                    self.audio_column = candidate
+                    print(f"Using '{candidate}' as audio column")
+                    break
+        
+        # Try to find text column
+        if self.text_column not in columns:
+            text_candidates = ['text', 'sentence', 'transcription', 'ayah', 'verse', 
+                             'arabic', 'arabic_text', 'transcript']
+            for candidate in text_candidates:
+                if candidate in columns:
+                    self.text_column = candidate
+                    print(f"Using '{candidate}' as text column")
+                    break
+        
+        print(f"Loaded {len(self.dataset)} samples")
+        print(f"Audio column: {self.audio_column}, Text column: {self.text_column}")
+    
+    def __len__(self) -> int:
+        return len(self.dataset)
+    
+    def __getitem__(self, idx: int) -> Dict:
+        item = self.dataset[idx]
+        
+        # Get audio data
+        audio_data = item[self.audio_column]
+        
+        # Handle different audio formats
+        if isinstance(audio_data, dict):
+            # HuggingFace audio format: {'array': [...], 'sampling_rate': 16000}
+            audio_array = audio_data['array']
+            sample_rate = audio_data['sampling_rate']
+        elif isinstance(audio_data, str):
+            # Audio file path - load it
+            import torchaudio
+            waveform, sample_rate = torchaudio.load(audio_data)
+            audio_array = waveform.numpy().flatten()
+        else:
+            # Assume numpy array
+            audio_array = audio_data
+            sample_rate = Config.SAMPLE_RATE
+        
+        # Convert to tensor and resample if necessary
+        waveform = torch.from_numpy(audio_array).float().unsqueeze(0)
+        if sample_rate != Config.SAMPLE_RATE:
+            import torchaudio
+            resampler = torchaudio.transforms.Resample(sample_rate, Config.SAMPLE_RATE)
+            waveform = resampler(waveform)
+        
+        # Extract features
+        features = self.audio_processor.extract_features(waveform)
+        
+        # Truncate if too long
+        if features.size(0) > self.max_audio_len:
+            features = features[:self.max_audio_len]
+        
+        # Get transcript (Quran ayah text)
+        transcript = item[self.text_column]
+        
+        # Clean Quran text (remove verse numbers, etc.)
+        transcript = self._clean_quran_text(transcript)
+        
+        encoded_text = self.text_processor.encode(transcript)
+        
+        # Truncate if too long
+        if len(encoded_text) > self.max_text_len:
+            encoded_text = encoded_text[:self.max_text_len]
+        
+        return {
+            'features': features,
+            'feature_length': features.size(0),
+            'targets': torch.tensor(encoded_text, dtype=torch.long),
+            'target_length': len(encoded_text),
+            'transcript': transcript
+        }
+    
+    def _clean_quran_text(self, text: str) -> str:
+        """
+        Clean Quran text for ASR training.
+        Removes verse numbers, special symbols, etc.
+        """
+        import re
+        
+        # Remove verse/ayah numbers (both Arabic and Western numerals)
+        text = re.sub(r'[٠١٢٣٤٥٦٧٨٩]+', '', text)
+        text = re.sub(r'\d+', '', text)
+        
+        # Remove common Quran symbols
+        text = re.sub(r'[۞۩﴾﴿]', '', text)
+        
+        # Remove brackets and parentheses
+        text = re.sub(r'[(){}\[\]﴾﴿]', '', text)
+        
+        # Remove extra whitespace
+        text = ' '.join(text.split())
+        
+        return text.strip()
+
+
+def create_quran_dataloaders(
+    dataset_name: str = "arbml/quran_speech",
+    train_split: str = "train",
+    val_split: str = "test",
+    audio_column: str = "audio",
+    text_column: str = "text",
+    batch_size: int = Config.BATCH_SIZE,
+    num_workers: int = 4,
+    subset: Optional[str] = None
+) -> Tuple[DataLoader, DataLoader]:
+    """
+    Create training and validation dataloaders for Quran dataset.
+    
+    Args:
+        dataset_name: HuggingFace dataset name
+        train_split: Training split name
+        val_split: Validation split name
+        audio_column: Column containing audio
+        text_column: Column containing text
+        batch_size: Batch size
+        num_workers: DataLoader workers
+        subset: Dataset subset/config
+    
+    Returns:
+        train_loader, val_loader
+    """
+    audio_processor = AudioProcessor()
+    text_processor = TextProcessor()
+    
+    train_dataset = QuranDataset(
+        dataset_name=dataset_name,
+        split=train_split,
+        audio_column=audio_column,
+        text_column=text_column,
+        audio_processor=audio_processor,
+        text_processor=text_processor,
+        subset=subset
+    )
+    
+    val_dataset = QuranDataset(
+        dataset_name=dataset_name,
+        split=val_split,
+        audio_column=audio_column,
+        text_column=text_column,
+        audio_processor=audio_processor,
+        text_processor=text_processor,
+        subset=subset
+    )
+    
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        collate_fn=collate_fn,
+        pin_memory=True
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=collate_fn,
+        pin_memory=True
+    )
+    
+    return train_loader, val_loader
+
+
 if __name__ == "__main__":
     # Test audio processing
     audio_processor = AudioProcessor()
